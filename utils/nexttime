@@ -1,0 +1,275 @@
+#!/usr/bin/env bash
+
+# Program name: nexttime
+# Author: griznog (griznog@gmail.com)
+# Purpose: 
+#   Accepts a crontab expression and returns the next
+#   resulting run time as a Slurm compatible date 
+#   string.
+
+##########################################################
+function usage () {
+  cat <<-EOF
+	
+	$0 minute_exp hour_exp day_of_month_exp month_expr weekday_expr
+	
+	Returns a Slurm --begin= argument specifying the next run 
+	time according to the given crontab expression. 
+	
+	Examples: 
+	  $0 "*" "*" "*" "*" "*" # Quoting is important.
+	
+	See 'man 5 crontab' for syntax. 
+	
+	EOF
+  if [[ -n $1 ]]; then 
+    echo "Error: $1"
+    echo
+  fi
+  exit 1
+} 
+
+###########################################################
+# Convert a term to its integer representation.
+# Takes two arguments, 
+# $1 = [start|end], are we converting the start of a range or the end.
+#      A single term is always start.
+# $2 = name, the name to convert. 
+function name_to_index () {
+  # convert day/month names to integers.
+  # start and end treated differently to handle
+  # Sunday as a special case. Probably a more clever 
+  # way to do this.
+  local retval      
+  if [[ ${2} =~ ^[0-9]+$ ]]; then
+    retval=${2}
+  else
+    case ${2} in 
+      sun*)
+        if [[ ${1} == "start" ]]; then
+          retval=0;
+        elif [[ ${1} == "end" ]]; then
+          retval=7;
+        else
+          usage "Don't know how to handle a ${1} term."
+          exit 1
+        fi
+        ;;
+      mon*|jan*) retval=1;;
+      tue*|feb*) retval=2;;
+      wed*|mar*) retval=3;;
+      thu*|apr*) retval=4;;
+      fri*|may*) retval=5;;
+      sat*|jun*) retval=6;;
+      jul*) retval=7;;
+      aug*) retval=8;;
+      sep*) retval=9;;
+      oct*) retval=10;;
+      nov*) retval=11;;
+      dec*) retval=12;;
+      *) 
+        usage "Invalid day/month: ${retval}"
+        exit 1
+        ;;
+    esac
+  fi
+  echo ${retval}
+}
+
+#########################################################
+# Expand a field into a map of viable entries.
+# argument 1: field index, 1, 2, 3, 4 or 5
+# argument 2: field value
+function expand () {
+  declare -A entries
+  # Convert names to integers.
+  for term in "${2//,/ }"; do
+    # Stepping over the entire possible range. 
+    if [[ "${term}" =~ \*\/*([0-9]+)* ]]; then
+      step=${BASH_REMATCH[1]}
+      [[ "${step}" == "" ]] && step=1
+      case "$1" in 
+        1) start=0; end=59;;
+        2) start=0; end=23;;
+        3) start=1; end=31;;
+        4) start=1; end=12;;
+        5) start=0; end=6;;
+        *) exit 1;;
+      esac
+      if [[ ${start} -ge ${end} ]]; then
+        usage "Invalid range: ${term}"
+        exit 1
+      fi
+      for (( i=${start}; i<=${end}; i+=${step} )); do
+        entries["${i}"]=1
+      done
+    # Stepping over a subrange. 
+    elif [[ ${term} =~ ([a-zA-Z0-9]+)\-([a-zA-Z0-9]+)\/([0-9]+) ]]; then
+      start="$(name_to_index start ${BASH_REMATCH[1],,})"
+      end="$( name_to_index end ${BASH_REMATCH[2],,})"
+      step="${BASH_REMATCH[3]}"
+      if [[ ${start} -ge ${end} ]]; then
+        usage "Invalid range: ${term}"
+        exit 1
+      fi
+      for (( i=${start}; i<=${end}; i+=${step} )); do
+        entries["${i}"]=1
+      done
+    # Expand a simple range. This ould be handled above if I had 
+    # better regexp powers.  
+    elif [[ ${term} =~ ([a-zA-Z0-9]+)\-([a-zA-Z0-9]+) ]]; then
+      start=$(name_to_index start ${BASH_REMATCH[1],,})
+      end=$(name_to_index end ${BASH_REMATCH[2],,})
+      if [[ ${start} -ge ${end} ]]; then
+        usage "Invalid range ${term}"
+        exit 1
+      fi
+      for (( i=${start}; i<=${end}; i+=1 )); do
+        entries["${i}"]=1
+      done
+    elif [[ ${term} =~ ^[a-zA-Z0-9]+$ ]]; then
+      entries["$(name_to_index start ${term,,})"]=1
+    else
+      usage "can't parse $1"
+      exit 1
+    fi
+  done
+  echo $( echo ${!entries[*]} | tr ' ' '\n' | sort -n | tr '\n' ' ' )
+}
+
+############################################################
+# Check if time is valid using global next_* variables.
+# Work up from minutes and if time is not valid
+# skip ahead as far as possible. 
+function valid_time () {
+  date=$(printf "%0.4d-%0.2d-%0.2d %0.2d:%0.2d" \
+               ${next_year} \
+               ${next_month} \
+               ${next_day_of_month} \
+               ${next_hour} \
+               ${next_minute})
+  next_day_of_week=$(${DATE} -d "${date}" "+%w")
+  if [[ "${days_of_week[${next_day_of_week}]}" -eq "0" ]]; then 
+    next_minute=59
+    next_hour=23
+    retval=1
+  elif ! ${DATE} -d "${date}" > /dev/null 2>&1; then
+    retval=1
+  elif [[ "${months[${next_month}]}" -eq "0" ]]; then
+    next_minute=59
+    next_hour=23
+    next_day_of_month=31
+    retval=1
+  elif [[ "${days_of_month[${next_day_of_month}]}" -eq "0" ]]; then
+    next_minute=59
+    next_hour=23
+    retval=1
+  elif [[ "${hours[${next_hour}]}" -eq "0" ]]; then
+    next_minute=59
+    retval=1
+  elif [[ "${minutes[${next_minute}]}" -eq "0" ]]; then
+    retval=1
+  else
+    retval=0
+  fi
+  return ${retval}
+}
+
+# Count forward one minute. 
+function increment_next_time () {
+  next_minute=$(( ( ${next_minute} + 1 ) % 60 ))
+  if [[ ${next_minute} == "0" ]]; then
+    next_hour=$(( ( ${next_hour} + 1 ) % 24 ))
+    if [[ ${next_hour} == "0" ]]; then
+      next_day_of_month=$(( ( ${next_day_of_month} + 1 ) % 32 ))
+      [[ ${next_day_of_month} -eq 0 ]] && next_day_of_month=1
+      if [[ ${next_day_of_month} == "1" ]]; then 
+        next_month=$(( ( ${next_month} + 1 ) % 13 ))
+        [[ ${next_month} -eq 0 ]] && next_month=1
+        if [[ ${next_month} == "1" ]]; then
+          next_year=$(( ${next_year} + 1 ))
+        fi
+      fi
+    fi
+  fi
+}
+
+
+##########################################################
+# Let's get this party started.
+
+# Find a data command. 
+DATE=$(which date)
+
+# 5 args or we abandon ship.
+if [ "$#" -ne 5 ]; then
+    usage "Illegal number of parameters"
+fi
+
+# Human day/month name lookup arrays.
+declare -a days months
+names_days=( "sun" "mon" "tue" "wed" "thu" "fri" "sat" "sun" )
+names_months=( "" "jan" "feb" "mar" "apr" "may" "jun" "jul" "aug" "sep" "oct" "nov" "dec" )
+
+# These assoc arrays will map allowed/denied time marks for each category.
+# A bitmap would be cooler, but I didn't want to read the man page to 
+# figure out bitwise arithmetic.
+for i in {0..59}; do minutes[$i]=0; done
+for i in {0..23}; do hours[$i]=0; done
+for i in {1..31}; do days_of_month[$i]=0; done
+for i in {1..12}; do months[$i]=0; done
+for i in {0..7}; do days_of_week[$i]=0; done
+
+
+# Expand all the expressions
+for i in $(expand 1 "${1}"); do minutes[$i]=1; done
+for i in $(expand 2 "${2}"); do hours[$i]=1; done
+for i in $(expand 3 "${3}"); do days_of_month[$i]=1; done
+for i in $(expand 4 "${4}"); do months[$i]=1; done
+for i in $(expand 5 "${5}"); do days_of_week[$i]=1; done
+
+# Set both Sundays if either is set.
+if [[ ${days_of_week[0]} == "1" ]] || [[ ${days_of_week[7]} == "1" ]]; then
+  days_of_week[0]=1
+  days_of_week[7]=1
+fi 
+
+# Optionally echo the maps created from expansion.
+if [[ ${DEBUG} == "true" ]]; then
+  echo "Minutes: ${minutes[*]}"
+  echo "Hours: ${hours[*]}"
+  echo "Days (of month): ${days_of_month[*]}"
+  echo "Months: ${months[*]}"
+  echo "Days (of week): ${days_of_week[*]}"
+fi
+
+# When is now?
+now=( $(${DATE} "+%-M %-H %-d %-m %u %Y") )
+current_minute=${now[0]}
+current_hour=${now[1]}
+current_day_of_month=${now[2]}
+current_month=${now[3]}
+current_day_of_week=${now[4]}
+current_year=${now[5]}
+
+# When is the soonest the next job could possibly run?
+next_minute=$((${current_minute} + 1))
+next_hour=${current_hour}
+next_day_of_month=${current_day_of_month}
+next_month=${current_month}
+next_year=${current_year}
+
+# As far as we want to look before giving up.
+limit_year=$(( $next_year + 2 ))
+
+# Walk forward into the future until we find a match. 
+while ! valid_time; do
+  increment_next_time
+  if [[ ${next_year} -eq ${limit_year} ]]; then
+    usage "Exceeded abitlity to peer into future."
+  fi
+done
+
+# Print the date we found. 
+printf "%s%4d-%0.2d-%0.2dT%0.2d:%0.2d:00\n" \
+  '--time=' ${next_year} ${next_month} ${next_day_of_month} ${next_hour} ${next_minute}
